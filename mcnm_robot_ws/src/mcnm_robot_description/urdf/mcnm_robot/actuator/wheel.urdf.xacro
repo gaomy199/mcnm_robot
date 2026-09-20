@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+    <!-- 引入质量和惯性参数 -->
+    <xacro:include filename="$(find mcnm_robot_description)/urdf/mcnm_robot/common_inertia.xacro" />
+
+    <!-- 声明 麦克纳姆轮 模块 -->
+    <xacro:macro name="wheel_xacro" params="wheel_name xyz">
+        <!-- 轮子可视化 -->
+        <link name="${wheel_name}_link">
+            <visual>
+                <origin xyz="0 0 0" rpy="${pi/2} 0 0" />
+                <geometry>
+                    <cylinder radius="0.038" length="0.032"/> 
+                </geometry>
+                <material name="blue">
+                    <color rgba="0 0 1.0 0.7" />
+                </material>
+            </visual>
+            <!-- 轮子碰撞属性 -->
+            <collision>
+                <origin xyz="0 0 0" rpy="${pi/2} 0 0" />
+                <geometry>
+                    <cylinder radius="0.038" length="0.032"/> 
+                </geometry>
+            </collision>
+            <!-- 惯性和质量属性 -->
+            <xacro:cylinder_inertia m = "0.11" r = "0.038" h = "0.032" />
+        </link>
+
+        <!-- 轮子关节 -->
+        <joint name="${wheel_name}_joint" type="continuous">
+            <parent link="base_link" />
+            <child link="${wheel_name}_link" />
+            <origin xyz="${xyz}" rpy="0 0 3.14159" />
+            <axis xyz="0 1 0" />
+        </joint>
+
+    </xacro:macro>
+</robot>

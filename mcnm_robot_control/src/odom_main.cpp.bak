@@ -1,0 +1,446 @@
+/**
+ * ESP32-WROOM-32E 麦克纳姆轮小车 micro-ROS 控制程序
+ *
+ * 基于原始 I2C 电机驱动板通信代码改造，增加：
+ *   1. micro-ROS 通过 WiFi 连接 Agent
+ *   2. 订阅 /cmd_vel（geometry_msgs/msg/Twist）控制底盘运动
+ *   3. 麦轮逆运动学：(vx, vy, wz) -> 4个电机转速指令
+ *   4. 读取编码器 + 正运动学 -> 里程计
+ *   5. 发布 /odom（nav_msgs/msg/Odometry）
+ *   注意：TF（odom->base_link）不在 ESP32 上发布，
+ *         请在上位机用 robot_state_publisher 或 static_transform_publisher 处理
+ *
+ * 硬件接线（独立供电方式）：
+ *   ESP32 GPIO18 (SDA) <---> 驱动板 IIC接口 SDA
+ *   ESP32 GPIO19 (SCL) <---> 驱动板 IIC接口 SCL
+ *   ESP32 GND          <---> 驱动板 IIC接口 GND  （必须共地！）
+ *
+ * 底盘电机位置（俯视，车头朝上）：
+ *       M1(左前)    M3(右前)
+ *       M2(左后)    M4(右后)
+ *
+ * 开发环境：PlatformIO + Arduino 框架，板子选 esp32dev
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <math.h>
+
+// ============ micro-ROS 头文件 ============
+#include <WiFi.h>
+#include <micro_ros_platformio.h>
+#include <rcl/rcl.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+#include <geometry_msgs/msg/twist.h>
+#include <nav_msgs/msg/odometry.h>
+
+// ============ WiFi 和 Agent 配置 ============
+// TODO: 改成你自己的配置
+#define WIFI_SSID       "Xiaomi50"
+#define WIFI_PASSWORD   "88888888"
+#define AGENT_IP        "192.168.31.139"
+#define AGENT_PORT      8888 
+
+// ============ ESP32 I2C 引脚配置 ============
+#define I2C_SDA_PIN  18
+#define I2C_SCL_PIN  19
+
+// ============ 驱动板 I2C 地址和寄存器（与原始代码完全一致）============
+#define I2C_ADDR                      0x34
+
+#define ADC_BAT_ADDR                  0
+#define MOTOR_TYPE_ADDR               20   // 寄存器地址：写入电机类型值
+#define MOTOR_ENCODER_POLARITY_ADDR   21   // 寄存器地址：写入编码器极性
+#define MOTOR_FIXED_PWM_ADDR          31   // 寄存器地址：开环PWM控制
+#define MOTOR_FIXED_SPEED_ADDR        51   // 寄存器地址：闭环转速控制（本程序使用）
+#define MOTOR_ENCODER_TOTAL_ADDR      60   // 寄存器地址：读取累计脉冲
+
+#define MOTOR_TYPE_WITHOUT_ENCODER    0
+#define MOTOR_TYPE_TT                 1
+#define MOTOR_TYPE_N20                2
+#define MOTOR_TYPE_JGB                3    // 本底盘使用：JGB37-520R90-12
+
+// ============ 底盘物理参数（单位：米）============
+// TODO: 请用尺子实测你的底盘，修正以下参数
+#define WHEEL_DIAMETER    0.065f     // 麦轮直径（米）
+#define WHEEL_RADIUS      (WHEEL_DIAMETER / 2.0f)
+#define CHASSIS_A         0.075f     // 底盘中心到前/后轮轴的纵向半距（米）
+#define CHASSIS_B         0.090f     // 底盘中心到左/右轮的横向半距（米）
+#define CHASSIS_AB        (CHASSIS_A + CHASSIS_B)
+
+// 编码器参数（JGB37-520R90-12：11线，减速比1:90）
+#define ENCODER_LINES     11
+#define GEAR_RATIO        90
+#define PULSES_PER_REV    (ENCODER_LINES * GEAR_RATIO)  // 990 脉冲/圈
+#define PULSE_TO_METER    (M_PI * WHEEL_DIAMETER / (float)PULSES_PER_REV)  // 每脉冲对应米数
+
+// 速度单位转换：m/s -> 驱动板指令值（脉冲数/10ms）
+// v(m/s) / PULSE_TO_METER(m/pulse) = pulse/s，再 / 100 = pulse/10ms
+#define MPS_TO_CMD        (1.0f / PULSE_TO_METER / 100.0f)
+
+// 控制周期
+#define CONTROL_PERIOD_MS  50    // 50ms = 20Hz
+#define CMD_TIMEOUT_MS     500   // 超时停车
+
+// ============ I2C 底层通信函数（保留原始代码不动）============
+
+uint8_t data[20];
+
+bool WireWriteByte(uint8_t val)
+{
+    Wire.beginTransmission(I2C_ADDR);
+    Wire.write(val);
+    if (Wire.endTransmission() != 0) {
+        return false;
+    }
+    return true;
+}
+
+bool WireWriteDataArray(uint8_t reg, uint8_t *val, unsigned int len)
+{
+    unsigned int i;
+    Wire.beginTransmission(I2C_ADDR);
+    Wire.write(reg);
+    for (i = 0; i < len; i++) {
+        Wire.write(val[i]);
+    }
+    if (Wire.endTransmission() != 0) {
+        return false;
+    }
+    return true;
+}
+
+bool WireReadDataByte(uint8_t reg, uint8_t &val)
+{
+    if (!WireWriteByte(reg)) {
+        return false;
+    }
+    Wire.requestFrom(I2C_ADDR, 1);
+    while (Wire.available()) {
+        val = Wire.read();
+    }
+    return true;
+}
+
+int WireReadDataArray(uint8_t reg, uint8_t *val, unsigned int len)
+{
+    unsigned char i = 0;
+    if (!WireWriteByte(reg)) {
+        return -1;
+    }
+    Wire.requestFrom(I2C_ADDR, (int)len);
+    while (Wire.available()) {
+        if (i >= len) {
+            return -1;
+        }
+        val[i] = Wire.read();
+        i++;
+    }
+    return i;
+}
+
+// ============ 电机配置参数（保留原始代码）============
+uint8_t MotorType = MOTOR_TYPE_JGB;
+uint8_t MotorEncoderPolarity = 0;
+
+int8_t car_stop[4] = {0, 0, 0, 0};
+
+// ============ 新增：编码器读取函数 ============
+
+/**
+ * 读取4个电机的累计编码器脉冲值
+ * 从寄存器地址 60 开始读 16 字节，每个电机 4 字节（int32，小端序）
+ */
+bool readEncoders(int32_t encoder_vals[4])
+{
+    uint8_t buf[16];
+    if (WireReadDataArray(MOTOR_ENCODER_TOTAL_ADDR, buf, 16) != 16) {
+        return false;
+    }
+    for (int i = 0; i < 4; i++) {
+        encoder_vals[i] = (int32_t)(buf[i * 4]
+                        | (buf[i * 4 + 1] << 8)
+                        | (buf[i * 4 + 2] << 16)
+                        | (buf[i * 4 + 3] << 24));
+    }
+    return true;
+}
+
+// ============ 新增：麦轮运动学 ============
+
+/**
+ * 逆运动学：底盘速度 (vx, vy, wz) -> 4个电机的驱动板转速指令
+ *
+ * 标准麦轮公式计算出每个轮子的线速度后，
+ * 根据你的底盘实测：前进时指令为 {30, -30, -30, 30}，
+ * 说明 M2、M3 的电气正方向与轮子前进方向相反，所以对 M2、M3 取反。
+ */
+void mecanum_inverse(float vx, float vy, float wz, int8_t out[4])
+{
+    float wheel[4];
+    wheel[0] =  ( vx - vy - CHASSIS_AB * wz) * MPS_TO_CMD;  // M1 左前
+    wheel[1] = -( vx + vy + CHASSIS_AB * wz) * MPS_TO_CMD;  // M2 左后（取反）
+    wheel[2] = -( vx + vy - CHASSIS_AB * wz) * MPS_TO_CMD;  // M3 右前（取反）
+    wheel[3] =  ( vx - vy + CHASSIS_AB * wz) * MPS_TO_CMD;  // M4 右后
+
+    for (int i = 0; i < 4; i++) {
+        if (wheel[i] > 50.0f) wheel[i] = 50.0f;
+        if (wheel[i] < -50.0f) wheel[i] = -50.0f;
+        out[i] = (int8_t)wheel[i];
+    }
+}
+
+/**
+ * 正运动学：4个电机编码器脉冲差 -> 底盘在本周期内的位移
+ * M2/M3 同样取反还原实际轮子方向
+ */
+void mecanum_forward(int32_t delta_pulse[4], float &dx, float &dy, float &dth)
+{
+    float d[4];
+    d[0] =  delta_pulse[0] * PULSE_TO_METER;   // M1 左前
+    d[1] = -delta_pulse[1] * PULSE_TO_METER;   // M2 左后（取反还原）
+    d[2] = -delta_pulse[2] * PULSE_TO_METER;   // M3 右前（取反还原）
+    d[3] =  delta_pulse[3] * PULSE_TO_METER;   // M4 右后
+
+    dx  = ( d[0] + d[1] + d[2] + d[3]) / 4.0f;
+    dy  = (-d[0] + d[1] + d[2] - d[3]) / 4.0f;
+    dth = (-d[0] - d[1] + d[2] + d[3]) / (4.0f * CHASSIS_AB);
+}
+
+// ============ 里程计状态 ============
+float odom_x = 0.0f;
+float odom_y = 0.0f;
+float odom_theta = 0.0f;
+float odom_vx = 0.0f;
+float odom_vy = 0.0f;
+float odom_wz = 0.0f;
+
+int32_t last_encoder[4] = {0, 0, 0, 0};
+bool encoder_initialized = false;
+unsigned long last_odom_time = 0;
+
+// ============ micro-ROS 全局对象 ============
+rcl_allocator_t allocator;
+rclc_support_t support;
+rclc_executor_t executor;
+rcl_node_t node;
+
+// 订阅 /cmd_vel
+rcl_subscription_t cmd_vel_sub;
+geometry_msgs__msg__Twist cmd_vel_msg;
+
+// 发布 /odom
+rcl_publisher_t odom_pub;
+nav_msgs__msg__Odometry odom_msg;
+
+// 定时器（定期发布里程计）
+rcl_timer_t odom_timer;
+
+// 当前 cmd_vel 指令（由回调更新，loop 中使用）
+volatile float cmd_vx = 0.0f;
+volatile float cmd_vy = 0.0f;
+volatile float cmd_wz = 0.0f;
+unsigned long last_cmd_time = 0;
+
+// ============ 回调函数 ============
+
+/**
+ * /cmd_vel 订阅回调：收到键盘/导航的运动指令，更新目标速度
+ */
+void cmd_vel_callback(const void *msg_in)
+{
+    const geometry_msgs__msg__Twist *msg = (const geometry_msgs__msg__Twist *)msg_in;
+    cmd_vx = msg->linear.x;    // 前后 (m/s)
+    cmd_vy = msg->linear.y;    // 左右 (m/s)，麦轮专用
+    cmd_wz = msg->angular.z;   // 旋转 (rad/s)
+    last_cmd_time = millis();
+}
+
+/**
+ * 欧拉角(仅yaw)转四元数
+ */
+void euler_to_quat(float theta, double &qx, double &qy, double &qz, double &qw)
+{
+    qx = 0.0;
+    qy = 0.0;
+    qz = sin(theta / 2.0);
+    qw = cos(theta / 2.0);
+}
+
+/**
+ * 里程计定时器回调：读编码器 -> 正运动学 -> 累计位姿 -> 发布 odom
+ */
+void odom_timer_callback(rcl_timer_t *timer, int64_t last_call_time)
+{
+    (void)last_call_time;
+    if (timer == NULL) return;
+
+    unsigned long now = millis();
+
+    // 1. 读取编码器
+    int32_t encoder_now[4];
+    if (!readEncoders(encoder_now)) return;
+
+    if (!encoder_initialized) {
+        for (int i = 0; i < 4; i++) last_encoder[i] = encoder_now[i];
+        encoder_initialized = true;
+        last_odom_time = now;
+        return;
+    }
+
+    // 2. 计算脉冲差
+    int32_t delta[4];
+    for (int i = 0; i < 4; i++) {
+        delta[i] = encoder_now[i] - last_encoder[i];
+        last_encoder[i] = encoder_now[i];
+    }
+
+    // 3. 正运动学
+    float dx, dy, dth;
+    mecanum_forward(delta, dx, dy, dth);
+
+    float dt = (now - last_odom_time) / 1000.0f;
+    last_odom_time = now;
+    if (dt <= 0) return;
+
+    // 4. 累计位姿（转换到世界坐标系）
+    odom_x += dx * cos(odom_theta) - dy * sin(odom_theta);
+    odom_y += dx * sin(odom_theta) + dy * cos(odom_theta);
+    odom_theta += dth;
+
+    odom_vx = dx / dt;
+    odom_vy = dy / dt;
+    odom_wz = dth / dt;
+
+    // 5. 发布 odom
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    odom_msg.header.stamp.sec = ts.tv_sec;
+    odom_msg.header.stamp.nanosec = ts.tv_nsec;
+    odom_msg.pose.pose.position.x = odom_x;
+    odom_msg.pose.pose.position.y = odom_y;
+    odom_msg.pose.pose.position.z = 0.0;
+
+    double qx, qy, qz, qw;
+    euler_to_quat(odom_theta, qx, qy, qz, qw);
+    odom_msg.pose.pose.orientation.x = qx;
+    odom_msg.pose.pose.orientation.y = qy;
+    odom_msg.pose.pose.orientation.z = qz;
+    odom_msg.pose.pose.orientation.w = qw;
+
+    odom_msg.twist.twist.linear.x = odom_vx;
+    odom_msg.twist.twist.linear.y = odom_vy;
+    odom_msg.twist.twist.angular.z = odom_wz;
+
+    rcl_publish(&odom_pub, &odom_msg, NULL);
+}
+
+// ============ micro-ROS 任务（独立 FreeRTOS 线程）============
+void micro_ros_task(void *parameter)
+{
+    // 1. 连接 WiFi 和 Agent（与你之前差速版本的写法一致）
+    IPAddress agent_ip;
+    agent_ip.fromString(AGENT_IP);
+    set_microros_wifi_transports(WIFI_SSID, WIFI_PASSWORD, agent_ip, AGENT_PORT);
+    delay(2000);
+
+    // 2. 初始化
+    allocator = rcl_get_default_allocator();
+    rclc_support_init(&support, 0, NULL, &allocator);
+
+    // 3. 创建节点
+    rclc_node_init_default(&node, "mecanum_base_controller", "", &support);
+
+    // 4. 创建 /cmd_vel 订阅
+    rclc_subscription_init_default(
+        &cmd_vel_sub, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
+        "cmd_vel");
+
+    // 5. 创建 /odom 发布者
+    rclc_publisher_init_default(
+        &odom_pub, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
+        "odom");
+
+    // 6. 初始化 odom 消息帧 ID
+    odom_msg.header.frame_id.data = (char*)"odom";
+    odom_msg.header.frame_id.size = 4;
+    odom_msg.header.frame_id.capacity = 5;
+    odom_msg.child_frame_id.data = (char*)"base_link";
+    odom_msg.child_frame_id.size = 9;
+    odom_msg.child_frame_id.capacity = 10;
+
+    // 7. 创建里程计定时器
+    rclc_timer_init_default(
+        &odom_timer, &support,
+        RCL_MS_TO_NS(CONTROL_PERIOD_MS),
+        odom_timer_callback);
+
+    // 8. 初始化执行器：1个订阅 + 1个定时器 = 2个 handle
+    rclc_executor_init(&executor, &support.context, 2, &allocator);
+    rclc_executor_add_subscription(&executor, &cmd_vel_sub, &cmd_vel_msg,
+                                    &cmd_vel_callback, ON_NEW_DATA);
+    rclc_executor_add_timer(&executor, &odom_timer);
+
+    // 9. 阻塞循环，处理 ROS2 收发
+    rclc_executor_spin(&executor);
+}
+
+// ============ setup()：保留原始驱动板初始化 + 启动 micro-ROS ============
+void setup()
+{
+    Serial.begin(115200);
+    Serial.println("Mecanum Base Controller Starting...");
+
+    // I2C 初始化（与原始代码一致）
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    delay(200);
+
+    // 驱动板初始化（与原始代码一致）
+    WireWriteDataArray(MOTOR_TYPE_ADDR, &MotorType, 1);
+    delay(5);
+    WireWriteDataArray(MOTOR_ENCODER_POLARITY_ADDR, &MotorEncoderPolarity, 1);
+    delay(2000);
+    Serial.println("Motor driver initialized.");
+
+    // 启动 micro-ROS 任务（与你差速版本的写法一致）
+    xTaskCreate(micro_ros_task,
+                "micro_ros",
+                10240,
+                NULL,
+                1,
+                NULL);
+}
+
+// ============ loop()：从演示循环改为实时 cmd_vel 控制 ============
+void loop()
+{
+    delay(CONTROL_PERIOD_MS);
+
+    // 超时保护：长时间没收到 cmd_vel 则停车
+    float vx, vy, wz;
+    if (millis() - last_cmd_time > CMD_TIMEOUT_MS) {
+        vx = 0.0f;
+        vy = 0.0f;
+        wz = 0.0f;
+    } else {
+        vx = cmd_vx;
+        vy = cmd_vy;
+        wz = cmd_wz;
+    }
+
+    // 逆运动学：(vx, vy, wz) -> [M1, M2, M3, M4] 转速指令
+    int8_t motor_cmd[4];
+    mecanum_inverse(vx, vy, wz, motor_cmd);
+
+    // 通过 I2C 发送给驱动板（与原始代码的 Running() 里写法一致）
+    WireWriteDataArray(MOTOR_FIXED_SPEED_ADDR, (uint8_t*)motor_cmd, 4);
+
+    // 调试输出
+    Serial.printf("cmd:[%d,%d,%d,%d] odom:(%.3f, %.3f, %.1f deg)\n",
+        motor_cmd[0], motor_cmd[1], motor_cmd[2], motor_cmd[3],
+        odom_x, odom_y, odom_theta * 180.0f / M_PI);
+}

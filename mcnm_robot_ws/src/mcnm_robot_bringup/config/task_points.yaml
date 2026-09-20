@@ -1,0 +1,15 @@
+task_executor:
+  ros__parameters:
+    # G 点：抓取点
+    grasp_x: 5.631582
+    grasp_y: 2.964488
+    grasp_yaw: 1.4949
+
+    # H 点：起始/返航点
+    home_x: 2.290079
+    home_y: -1.245133
+    home_yaw: -1.4655
+
+    grasp_script: '/home/joyandai/lerobot/eval_train3_080000_once.sh'  # 指定抓取脚本
+    grasp_timeout_sec: 100  # 真脚本约 110 秒
+    return_home: true      # 还没接 Nav2，保持 false

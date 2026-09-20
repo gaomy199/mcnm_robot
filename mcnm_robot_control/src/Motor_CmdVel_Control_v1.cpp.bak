@@ -1,0 +1,173 @@
+/**
+ * ESP32-WROOM-32E 麦克纳姆轮小车 micro-ROS 控制程序
+ *
+ * 实现原理/过程：
+ *   1. micro-ROS 通过 WiFi 连接 Agent
+ *   2. 订阅cmd_vel（geometry_msgs/msg/Twist）
+ *   3. 麦轮逆运动学：(vx, vy, wz) -> 4个电机转速指令
+ *   4. 通过 I2C 向驱动板写入转速指令
+ *
+ * 底盘电机位置（俯视，车头朝上）：
+ *       M1(左前)    M3(右前)
+ *       M2(左后)    M4(右后)
+ * =======================================================
+ * 编码器读取的每10ms脉冲数与指令值一致。最大指令50下转速为75.8RPM
+ * 其余的值按照线性映射就行
+ * =======================================================
+ */
+
+#include <Arduino.h>                 // Arduino标准头文件
+#include <Wire.h>                    // I2C 头文件
+#include <WiFi.h>                    // WiFi 头文件
+#include <micro_ros_platformio.h>    // micro-ROS 头文件
+#include <rcl/rcl.h>                 // ROS2 头文件
+#include <rclc/rclc.h>               // ROS2 控制器头文件
+#include <rclc/executor.h>           // ROS2 执行器头文件
+#include <geometry_msgs/msg/twist.h> // geometry_msgs/msg/Twist 头文件
+#include <Kinematics.h>              // 麦轮运动学库
+
+// ============ WiFi 和 Agent 配置 ============
+#define WIFI_SSID "Xiaomi50"      // WiFi 名称
+#define WIFI_PASSWORD "88888888"  // WiFi 密码
+#define AGENT_IP "192.168.31.139" // Agent IP，即电脑的ipv4地址
+#define AGENT_PORT 8888           // Agent 端口
+
+// ============ I2C 配置 ============
+/* 如果采用其他esp32引脚，因为芯片自带上拉电阻是45k欧姆，不建议使用，建议外加上拉电阻4.7k欧姆
+   上拉电阻即在引脚上引出一根电线，经过4.7k电阻后接入3.33V，则引脚为3.3V，实现上拉效果。*/
+#define I2C_SDA_PIN 18
+#define I2C_SCL_PIN 19
+#define I2C_ADDR 0x34 // 驱动板I2C地址
+
+// ============ 驱动板寄存器地址 ============
+#define MOTOR_TYPE_ADDR 20             // 电机地址
+#define MOTOR_ENCODER_POLARITY_ADDR 21 // 电机编码器极性
+#define MOTOR_FIXED_SPEED_ADDR 51      // 闭环控制
+#define MOTOR_TYPE_JGB 3               // 电机类型JBG
+
+// ============ 底盘物理参数（米）============
+#define WHEEL_DIAMETER 0.075f                                    // 轮子直径
+#define LENGTH_HALF 0.12f                                        // 底盘A轴长度，半个轴距
+#define WIDTH_HALF 0.135f                                        // 底盘B轴长度，半个轮距
+#define ENCODER_LINES 11                                         // 磁环个数
+#define GEAR_RATIO 90                                            // 减速比
+#define QUADRATURE 4                                             // AB双相四倍频
+#define PULSES_PER_REV (ENCODER_LINES * QUADRATURE * GEAR_RATIO) // 轮圈编码器脉冲数3960pulse/r
+
+// 控制参数
+#define CONTROL_PERIOD_MS 50
+#define CMD_TIMEOUT_MS 500
+
+// ============ 全局对象 ============
+
+// 运动学实例（构造时传入底盘参数）
+Kinematics kinematics(WHEEL_DIAMETER, LENGTH_HALF, WIDTH_HALF, PULSES_PER_REV);
+
+// ============ I2C 通信函数 ============
+bool WireWriteDataArray(uint8_t reg, uint8_t *val, unsigned int len)
+{
+    Wire.beginTransmission(I2C_ADDR);
+    Wire.write(reg);
+    for (unsigned int i = 0; i < len; i++)
+    {
+        Wire.write(val[i]);
+    }
+    return (Wire.endTransmission() == 0);
+}
+
+// ============ micro-ROS 全局对象 ============
+rcl_allocator_t allocator;             // 创建分配器
+rclc_support_t support;                // 创建支持
+rclc_executor_t executor;              // 创建执行器
+rcl_node_t node;                       // 创建节点
+rcl_subscription_t cmd_vel_sub;        // 创建订阅
+geometry_msgs__msg__Twist cmd_vel_msg; // 创建cmd_vel消息
+
+volatile float cmd_vx = 0.0f;
+volatile float cmd_vy = 0.0f;
+volatile float cmd_wz = 0.0f;
+unsigned long last_cmd_time = 0;
+
+// ============ 回调 ============
+void cmd_vel_callback(const void *msg_in)
+{
+    const geometry_msgs__msg__Twist *msg = (const geometry_msgs__msg__Twist *)msg_in;
+    cmd_vx = msg->linear.x;
+    cmd_vy = msg->linear.y;
+    cmd_wz = msg->angular.z;
+    last_cmd_time = millis();
+}
+
+// ============ micro-ROS 任务 ============
+void micro_ros_task(void *parameter)
+{
+    IPAddress agent_ip;
+    agent_ip.fromString(AGENT_IP);
+    set_microros_wifi_transports(WIFI_SSID, WIFI_PASSWORD, agent_ip, AGENT_PORT);
+    delay(2000);
+
+    allocator = rcl_get_default_allocator();
+    rclc_support_init(&support, 0, NULL, &allocator);
+    rclc_node_init_default(&node, "mecanum_base_controller", "", &support);
+
+    rclc_subscription_init_default(
+        &cmd_vel_sub, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
+        "cmd_vel");
+
+    rclc_executor_init(&executor, &support.context, 1, &allocator);
+    rclc_executor_add_subscription(&executor, &cmd_vel_sub, &cmd_vel_msg,
+                                   &cmd_vel_callback, ON_NEW_DATA);
+    rclc_executor_spin(&executor);
+}
+
+// ============ setup / loop ============
+void setup()
+{
+    Serial.begin(115200);
+    Serial.println("Mecanum Base Controller Starting...");
+
+    // I2C 初始化
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    delay(200);
+
+    // 驱动板初始化
+    uint8_t motor_type = MOTOR_TYPE_JGB;
+    uint8_t encoder_polarity = 0;
+    WireWriteDataArray(MOTOR_TYPE_ADDR, &motor_type, 1);
+    delay(5);
+    WireWriteDataArray(MOTOR_ENCODER_POLARITY_ADDR, &encoder_polarity, 1);
+    delay(2000);
+    Serial.println("Motor driver initialized.");
+
+    // 启动 micro-ROS 任务
+    xTaskCreate(micro_ros_task, "micro_ros", 10240, NULL, 1, NULL);
+}
+
+void loop()
+{
+    delay(CONTROL_PERIOD_MS);
+
+    // 超时停车
+    float vx, vy, wz;
+    if (millis() - last_cmd_time > CMD_TIMEOUT_MS)  //每次指令只执行500ms
+    {
+        vx = vy = wz = 0.0f;
+    }
+    else
+    {
+        vx = cmd_vx;
+        vy = cmd_vy;
+        wz = cmd_wz;
+    }
+
+    // 调用运动学库做逆解
+    int8_t motor_cmd[4];
+    kinematics.kinematics_inverse(vx, vy, wz, motor_cmd);
+
+    // I2C 发送给驱动板
+    WireWriteDataArray(MOTOR_FIXED_SPEED_ADDR, (uint8_t *)motor_cmd, 4);
+
+    Serial.printf("cmd:[%d,%d,%d,%d]\n",
+                  motor_cmd[0], motor_cmd[1], motor_cmd[2], motor_cmd[3]);
+}

@@ -1,0 +1,142 @@
+/**
+ * 编码器手动读取测试
+ *
+ * 功能：不给电机任何指令（电机不转），手动转动车轮时，
+ *       通过串口实时显示4个编码器的累计脉冲值和脉冲变化量。
+ *
+ * 用途：
+ *   - 确认编码器接线是否正确
+ *   - 确认每个电机对应的是 M1/M2/M3/M4 哪个
+ *   - 观察正转/反转时脉冲的正负方向
+ *   - 手动转一整圈，数脉冲数，验证每圈脉冲数是否为 990
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+
+// ============ I2C 配置 ============
+#define I2C_SDA_PIN  18
+#define I2C_SCL_PIN  19
+#define I2C_ADDR     0x34
+
+// ============ 驱动板寄存器地址 ============
+#define MOTOR_TYPE_ADDR               20
+#define MOTOR_ENCODER_POLARITY_ADDR   21
+#define MOTOR_FIXED_SPEED_ADDR        51
+#define MOTOR_ENCODER_TOTAL_ADDR      60
+#define MOTOR_TYPE_JGB                3
+
+// ============ I2C 通信函数 ============
+
+bool WireWriteByte(uint8_t val)
+{
+    Wire.beginTransmission(I2C_ADDR);
+    Wire.write(val);
+    return (Wire.endTransmission() == 0);
+}
+
+bool WireWriteDataArray(uint8_t reg, uint8_t *val, unsigned int len)
+{
+    Wire.beginTransmission(I2C_ADDR);
+    Wire.write(reg);
+    for (unsigned int i = 0; i < len; i++) {
+        Wire.write(val[i]);
+    }
+    return (Wire.endTransmission() == 0);
+}
+
+int WireReadDataArray(uint8_t reg, uint8_t *val, unsigned int len)
+{
+    unsigned char i = 0;
+    if (!WireWriteByte(reg)) return -1;
+    Wire.requestFrom(I2C_ADDR, (int)len);
+    while (Wire.available()) {
+        if (i >= len) return -1;
+        val[i] = Wire.read();
+        i++;
+    }
+    return i;
+}
+
+// ============ 编码器读取 ============
+
+bool readEncoders(int32_t encoder_vals[4])
+{
+    uint8_t buf[16];
+    if (WireReadDataArray(MOTOR_ENCODER_TOTAL_ADDR, buf, 16) != 16) {
+        return false;
+    }
+    for (int i = 0; i < 4; i++) {
+        encoder_vals[i] = (int32_t)( buf[i * 4]
+                                   | (buf[i * 4 + 1] << 8)
+                                   | (buf[i * 4 + 2] << 16)
+                                   | (buf[i * 4 + 3] << 24));
+    }
+    return true;
+}
+
+// ============ 全局变量 ============
+int32_t last_encoder[4] = {0, 0, 0, 0};
+bool first_read = true;
+
+void setup()
+{
+    Serial.begin(115200);
+    Serial.println("编码器手动读取测试");
+    Serial.println("请手动转动车轮，观察串口输出");
+    Serial.println();
+
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    delay(200);
+
+    // 驱动板初始化
+    uint8_t motor_type = MOTOR_TYPE_JGB;
+    uint8_t encoder_polarity = 0;
+    WireWriteDataArray(MOTOR_TYPE_ADDR, &motor_type, 1);
+    delay(5);
+    WireWriteDataArray(MOTOR_ENCODER_POLARITY_ADDR, &encoder_polarity, 1);
+    delay(2000);
+
+    // 确保电机停止
+    int8_t stop[4] = {0, 0, 0, 0};
+    WireWriteDataArray(MOTOR_FIXED_SPEED_ADDR, (uint8_t*)stop, 4);
+
+    Serial.println("驱动板初始化完成，电机已停止。");
+    Serial.println("------------------------------------------------------------------");
+    Serial.println("         累计脉冲                    |       本次变化量");
+    Serial.println("  M1       M2       M3       M4     |  dM1    dM2    dM3    dM4");
+    Serial.println("------------------------------------------------------------------");
+}
+
+void loop()
+{
+    delay(200);  // 每 200ms 读一次，手动转动不需要太快
+
+    int32_t encoder_now[4];
+    if (!readEncoders(encoder_now)) {
+        Serial.println("读取失败！检查 I2C 接线。");
+        return;
+    }
+
+    if (first_read) {
+        for (int i = 0; i < 4; i++) last_encoder[i] = encoder_now[i];
+        first_read = false;
+        return;
+    }
+
+    // 计算变化量
+    int32_t delta[4];
+    bool any_change = false;
+    for (int i = 0; i < 4; i++) {
+        delta[i] = encoder_now[i] - last_encoder[i];
+        if (delta[i] != 0) any_change = true;
+        last_encoder[i] = encoder_now[i];
+    }
+
+    // 只在有变化时才打印，避免刷屏
+    if (any_change) {
+        Serial.printf("%7d  %7d  %7d  %7d   | %5d  %5d  %5d  %5d\n",
+            encoder_now[0], encoder_now[1], encoder_now[2], encoder_now[3],
+            delta[0], delta[1], delta[2], delta[3]);
+    }
+}

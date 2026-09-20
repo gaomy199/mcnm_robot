@@ -1,0 +1,22 @@
+teleop_twist_joy_node:
+  ros__parameters:
+    axis_linear:
+      x: 1        # 左摇杆 上下 → 前后
+      y: 0        # 左摇杆 左右 → 左右平移（麦轮专属）
+    axis_angular:
+      yaw: 3      # 右摇杆 左右 → 旋转
+
+    scale_linear:
+      x: 0.5      # 前后最大速度 m/s
+      y: 0.5      # 平移最大速度 m/s（麦轮）
+    scale_angular:
+      yaw: 1.0    # 旋转最大速度 rad/s
+
+    scale_linear_turbo:
+      x: 1.0
+      y: 1.0
+    scale_angular_turbo:
+      yaw: 2.0
+
+    enable_button: 4       # LB 键按住才能动（安全锁）
+    enable_turbo_button: 5 # RB 键按住进入加速模式

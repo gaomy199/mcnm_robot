@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" >
+    <!-- 引入质量和惯性参数 -->
+    <xacro:include filename="$(find mcnm_robot_description)/urdf/mcnm_robot/common_inertia.xacro" />
+
+    <xacro:macro name="base_xacro" params="length width height">
+        <!-- 声明 base_footprint 模块 -->
+        <link name="base_footprint" />
+        <!-- 声明 base_link 模块 -->
+        <link name="base_link">
+            <visual>
+                <origin xyz="0 0 0" rpy="0 0 0" />
+                <geometry>
+                    <box size="${length} ${width} ${height}" />
+                </geometry>
+                <material name="white">
+                    <color rgba="1.0 1.0 1.0 0.5" />
+                </material>
+            </visual>
+            <!-- 碰撞体属性 -->
+            <collision>
+                <origin xyz="0 0 0" rpy="0 0 0" />
+                <geometry>
+                    <box size="${length} ${width+0.11} ${height}" />
+                </geometry>
+                <material name="white">
+                    <color rgba="0.7 0.7 0.7 0.3" />
+                </material>
+            </collision>
+            <!-- 惯性和质量属性 -->
+            <xacro:box_inertia m = "3.0" l = "${length}" w = "${width}" h = "${height}" />
+        </link>
+
+        <joint name="base_link_joint" type="fixed">
+            <parent link="base_footprint" />
+            <child link="base_link" />
+            <origin xyz="0 0 0.041" rpy="0 0 0" />
+        </joint>
+
+    </xacro:macro>
+</robot>

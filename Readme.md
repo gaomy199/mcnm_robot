@@ -1,0 +1,4 @@
+mcnm_robot_code文件夹里面放置了本项目所有的机器人模型文件和任务启动文件，
+其中mcnm_robot_ws下面是机器人的ROS2工作空间，包含了在ROS2 Humble下面定义的各个功能包;
+mcnm_robot_control下面是机器人的底盘esp32烧录程序;
+micros_ws和lidar_ws下面是micro-ROS Agent和RPLIDAR激光雷达的ROS2工作空间，均可直接按照对应的readme介绍从github上拉取源码。

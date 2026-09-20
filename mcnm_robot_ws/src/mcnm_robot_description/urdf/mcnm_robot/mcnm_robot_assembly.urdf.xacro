@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="mcnm_robot_assembly">
+    <!-- body部分——base_link -->
+    <xacro:include filename="$(find mcnm_robot_description)/urdf/mcnm_robot/base.urdf.xacro"/>
+    <!-- 传感器部分 -->
+    <!--<xacro:include filename="$(find mcnm_robot_description)/urdf/mcnm_robot/sensor/imu.urdf.xacro"/>-->
+    <xacro:include filename="$(find mcnm_robot_description)/urdf/mcnm_robot/sensor/laser.urdf.xacro"/>
+    <!-- 执行器部分 -->
+    <xacro:include filename="$(find mcnm_robot_description)/urdf/mcnm_robot/actuator/wheel.urdf.xacro"/>
+    
+    <!-- 调用各个宏 -->
+    <xacro:base_xacro length="0.385" width="0.31" height="0.061"/>
+    <!--<xacro:imu_xacro xyz = "0 0.05 0.0" />-->
+    <xacro:laser_xacro xyz = "0.152 0.0 0.0455" />
+
+    <xacro:wheel_xacro wheel_name = "M1" xyz = "0.119 0.137 -0.004" />
+    <xacro:wheel_xacro wheel_name = "M2" xyz = "-0.119 0.137 -0.004" />
+    <xacro:wheel_xacro wheel_name = "M3" xyz = "0.119 -0.137 -0.004" />
+    <xacro:wheel_xacro wheel_name = "M4" xyz = "-0.119 -0.137 -0.004" />
+
+</robot> 

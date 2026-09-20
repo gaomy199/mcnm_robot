@@ -1,0 +1,184 @@
+/**
+ * 编码器测速测试程序
+ * 功能：给电机一个固定转速指令，然后持续读取编码器脉冲，
+ *       计算每个电机的实际转速（脉冲数/10ms），与指令值对比。
+ *
+ * 用法：修改 test_speed[] 数组设置想测试的指令值，
+ *       烧录后打开串口监视器（115200）观察输出。
+ * 
+ * ========================= 测试结果：==================================
+ * 输出大致为 103.0 |  21.36  |  -21.36  |  -21.36  |  21.45
+ * 结果表示指令为20的时候，实际上对应电机的速度大概也是20pulse/10ms，也就是说对应电机转速为2000/3960*60s=30.3RPM
+ * 测试结果表明，编码器读取的每10ms脉冲数与指令值一致。最大指令50下转速为75.8RPM
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+
+// ============ I2C 配置 ============
+#define I2C_SDA_PIN  18                      //SDA引脚
+#define I2C_SCL_PIN  19                      //SCL引脚
+#define I2C_ADDR     0x34                    //电机控制板I2C地址
+
+// ============ 驱动板各寄存器地址和电机参数配置 ============
+#define MOTOR_TYPE_ADDR               20     //电机类型寄存器0x14
+#define MOTOR_ENCODER_POLARITY_ADDR   21     //编码器极性寄存器0x15
+#define MOTOR_FIXED_PWM_ADDR          31     //开环控制寄存器地址 0x1F：固定 PWM 开环控制，范围 -100~100
+#define MOTOR_FIXED_SPEED_ADDR        51     //闭环控制指令值寄存器地址 0x33：闭环控制转速。范围 -50~50
+#define MOTOR_ENCODER_TOTAL_ADDR      60     //编码器累计脉冲寄存器地址 0x3C：编码器累计脉冲
+#define MOTOR_TYPE_JGB                3      //电机类型：JGB，详见Motor_MotionCtrl_Test.cpp
+
+// ============ I2C 通信函数 ============
+/**
+ * 向驱动板发送单个字节（通常用于指定要读取的寄存器地址）
+ * @param val  要发送的字节
+ * @return     发送成功返回 true，失败返回 false
+ */
+bool WireWriteByte(uint8_t val)
+{
+    Wire.beginTransmission(I2C_ADDR); //向驱动板发送数据
+    Wire.write(val);
+    return (Wire.endTransmission() == 0);
+}
+
+bool WireWriteDataArray(uint8_t reg, uint8_t *val, unsigned int len)
+{
+    Wire.beginTransmission(I2C_ADDR);
+    Wire.write(reg);
+    for (unsigned int i = 0; i < len; i++) {
+        Wire.write(val[i]);
+    }
+    return (Wire.endTransmission() == 0);
+}
+
+int WireReadDataArray(uint8_t reg, uint8_t *val, unsigned int len)
+{
+    unsigned char i = 0;
+    if (!WireWriteByte(reg)) return -1;
+    Wire.requestFrom(I2C_ADDR, (int)len);
+    while (Wire.available()) {
+        if (i >= len) return -1;
+        val[i] = Wire.read();
+        i++;
+    }
+    return i;
+}
+
+// ============ 编码器读取函数 ============
+
+/**
+ * 读取4个电机的累计编码器脉冲值
+ * 寄存器地址 60 开始，每个电机 4 字节（int32，小端序），共 16 字节
+ */
+bool readEncoders(int32_t encoder_vals[4])
+{
+    uint8_t buf[16];
+    if (WireReadDataArray(MOTOR_ENCODER_TOTAL_ADDR, buf, 16) != 16) {
+        return false;
+    }
+    for (int i = 0; i < 4; i++) {
+        encoder_vals[i] = (int32_t)( buf[i * 4]
+                                   | (buf[i * 4 + 1] << 8)
+                                   | (buf[i * 4 + 2] << 16)
+                                   | (buf[i * 4 + 3] << 24));
+    }
+    return true;
+}
+
+// ============ 全局变量 ============
+
+int32_t last_encoder[4] = {0, 0, 0, 0};
+bool first_read = true;
+unsigned long last_time = 0;
+
+// ★ 修改这里设置你要测试的指令值，范围 [-50, 50]
+// 顺序 [M1(左前), M2(左后), M3(右前), M4(右后)]
+// 例1：四个电机都给 20
+int8_t test_speed[4] = {20, -20, -20, 20};  // 前进指令
+// 例2：只测单个电机
+// int8_t test_speed[4] = {20, 0, 0, 0};    // 只有 M1
+
+int8_t car_stop[4] = {0, 0, 0, 0};
+
+void setup()
+{
+    Serial.begin(115200);
+    Serial.println("开始测试读取编码器脉冲速度...");
+
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);  //初始化 I2C 通信引脚
+    delay(200);                            // 等待 I2C 引脚初始化完成
+
+    // 驱动板初始化
+    uint8_t motor_type = MOTOR_TYPE_JGB;   // 设置电机类型
+    uint8_t encoder_polarity = 0;          // 设置编码器极性，默认是0
+    WireWriteDataArray(MOTOR_TYPE_ADDR, &motor_type, 1);                   //向寄存器写入电机类型
+    delay(5);
+    WireWriteDataArray(MOTOR_ENCODER_POLARITY_ADDR, &encoder_polarity, 1); //向寄存器写入编码器极性
+    delay(2000);                           // 等待电机启动完成
+    Serial.println("电机初始化完成！");
+
+    // 发送测试速度指令
+    Serial.printf("设置电机速度: [%d, %d, %d, %d]\n",
+        test_speed[0], test_speed[1], test_speed[2], test_speed[3]);
+    WireWriteDataArray(MOTOR_FIXED_SPEED_ADDR, (uint8_t*)test_speed, 4);   //发送四个电机指令
+
+    // 打印表头
+    Serial.println("----------------------------------------------------------------------------");
+    Serial.println("  dt(ms)  |  M1_speed  |  M2_speed  |  M3_speed  |  M4_speed  | (pulse/10ms)");
+    Serial.println("----------------------------------------------------------------------------");
+}
+
+void loop()
+{
+    delay(100);  // 每 100ms 读一次编码器
+
+    // 读取当前编码器累计脉冲
+    int32_t encoder_now[4];
+    if (!readEncoders(encoder_now)) {
+        Serial.println("读取编码器失败！检查 I2C 接线。");
+        return;
+    }
+
+    unsigned long now = millis();
+
+    if (first_read) {
+        // 第一次只记录初始值，不用计算时间间隔
+        for (int i = 0; i < 4; i++) last_encoder[i] = encoder_now[i];
+        last_time = now;
+        first_read = false;
+        return;
+    }
+
+    // 计算时间间隔
+    float dt_ms = now - last_time;
+    last_time = now;
+
+    // 计算每个电机的脉冲差
+    int32_t delta[4];
+    for (int i = 0; i < 4; i++) {
+        delta[i] = encoder_now[i] - last_encoder[i];
+        last_encoder[i] = encoder_now[i];
+    }
+
+    // 换算成 "脉冲数/10ms"（与驱动板指令单位一致）
+    // delta 是 dt_ms 内的脉冲数，换算：speed = delta / dt_ms * 10
+    float actual_speed[4];
+    for (int i = 0; i < 4; i++) {
+        actual_speed[i] = (float)delta[i] / dt_ms * 10.0f;  //代表每10ms的脉冲数，代表电机的 RPM 值
+    }
+
+    // 打印结果
+    Serial.printf("  %6.1f  | %7.2f  | %7.2f  | %7.2f  | %7.2f\n",
+        dt_ms, actual_speed[0], actual_speed[1], actual_speed[2], actual_speed[3]);
+
+    // 运行 10 秒后自动停车
+    static unsigned long start_time = millis();
+    if (millis() - start_time > 10000) {
+        WireWriteDataArray(MOTOR_FIXED_SPEED_ADDR, (uint8_t*)car_stop, 4);
+        Serial.println("----------------------------------------------");
+        Serial.println("测试结束，电机已停止。");
+        Serial.printf("指令值: [%d, %d, %d, %d]\n",
+            test_speed[0], test_speed[1], test_speed[2], test_speed[3]);
+        while (1) { delay(1000); }   //这里停顿，防止串口打印被中断，while (1) 一直循环，程序不退出，陷入死循环
+    }
+}
