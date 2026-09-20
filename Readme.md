@@ -1,6 +1,4 @@
-<video width="600" controls>
-  <source src="videos/running.mp4" type="video/mp4">
-</video>
+<video src="https://github.com/gaomy199" controls width="600"></video>
 
 本项目特点是一种带分层电源管理与双主控架构的全向移动操作机器人。
 主要组成包括全向移动底盘、感知模块、双主控控制单元、主动散热模块、机械臂模块、分层电源管理模块和信号抗干扰模块；
