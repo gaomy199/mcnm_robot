@@ -33,10 +33,16 @@
 
 本项目的机器人成品图以及拆开视角:
 1、成品图
+
 ![alt text](pictures/wholebody.png)
 
+
+
 2、拆开视角
+
 ![alt text](pictures/disassembly.png)
+
+
 
 1. 底盘前置RGB相机；2. 麦克纳姆轮；3. 过流保护模块1；
 2. 电源分路模块；5. 过流保护模块2；6. 主控隔离单元；
@@ -48,10 +54,16 @@
 
 
 本项目的电气架构:
+
 ![alt text](pictures/electricity.png)
 
+
+
 本项目的软件框架:
+
 ![alt text](pictures/softwareframe.png)
+
+
 
 BOM表:
 | 序号 | 名称 | 型号 | 数量 | 备注 |
